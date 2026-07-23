@@ -1,97 +1,193 @@
 # DeepWiki Documentation Exporter
 
-A zero-dependency Python tool for exporting documentation repositories from [DeepWiki](https://deepwiki.com) to clean, local Markdown. Supports high-speed JSON-RPC fetching via DeepWiki's Model Context Protocol (MCP) server, automatic web-scraping fallback, and multi-file document bundling.
+The DeepWiki Documentation Exporter is a Python-based utility designed to automate the extraction and local export of documentation from DeepWiki repositories. 
 
-## Features
+The application connects directly to Cognition's DeepWiki Model Context Protocol (MCP) server over JSON-RPC 2.0, fetches repository structures, and builds well-formatted Markdown documentation bundles locally. In cases where the protocol interface is unavailable, the exporter automatically uses a secondary client-side web parsing engine.
 
-- **Flexible Target Parsing**: Accepts direct repo strings (`owner/repo`), DeepWiki page URLs, and standard GitHub repository links.
-- **MCP Native Client**: Interfaces directly with DeepWiki's MCP endpoint (`https://mcp.deepwiki.com/mcp`) using JSON-RPC 2.0 and Server-Sent Events (SSE) streaming support with automatic exponential backoff retries.
-- **Resilient Fallback**: Automatically falls back to client-side extraction (`__NEXT_DATA__` standard page JSON / direct DOM) if the primary MCP server is unreachable.
-- **Single or Multi-File Output**:
-  - **Single File**: Aggregates all chapters into a unified Markdown file.
-  - **Multi-File (`--multi-file`)**: Splits content into organized, sequentially numbered Markdown files with an auto-generated table of contents (`README.md`).
-- **Zero External Dependencies**: Built entirely on standard Python 3 standard library packages (`urllib`, `json`, `re`, `pathlib`, `argparse`).
+---
 
-## Installation
+## Key Features
 
-Ensure you have Python 3.8+ installed. Save the script as `export_deepwiki.py` and grant execution permissions:
+- **Zero Third-Party Dependencies**: Built entirely using the Python Standard Library (`urllib`, `re`, `json`, `pathlib`, `argparse`).
+- **MCP JSON-RPC Protocol Support**: Communicates natively with Model Context Protocol endpoints using standard `tools/call` methods (`read_wiki_structure`, `read_wiki_contents`).
+- **Sidebar Hierarchy Extraction**: Parses inline CSS styles (such as `padding-left` indentations) and Next.js page state blocks (`__NEXT_DATA__`) to preserve nested table of contents structures.
+- **Flexible Export Modes**:
+  - **Single-File Mode**: Compiles all repository content into a single, consolidated Markdown document.
+  - **Multi-File Mode (`--multi-file`)**: Generates discrete Markdown files for each documentation page based on route slugs, alongside a root `README.md` index file.
+- **Fault-Tolerant Architecture**: Implements automatic retries with exponential backoff for network interfaces and falls back to HTTP web scraping if the MCP endpoint is unreachable.
+- **Flexible Input Parsing**: Accepts both shorthand repository identifiers (`owner/repo`) and complete standard web URLs (`https://deepwiki.com/owner/repo`).
 
-```bash
-chmod +x export_deepwiki.py
+---
+
+## Architecture Overview
+
+The application follows a structured workflow to parse input parameters, extract structure metadata, retrieve page content, and format output files.
+
+### Workflow Diagram
+
+```mermaid
+flowchart TD
+    A[Input: Repo String / URL] --> B[DeepWikiURLParser]
+    B -->|Normalized owner/repo| C[DeepWikiSidebarFetcher]
+    
+    subgraph Structure Discovery
+        C --> D1[Extract Links & Padding]
+        C --> D2[Parse __NEXT_DATA__ State]
+        C --> D3[Query MCP read_wiki_structure]
+    end
+
+    D1 --> E[Navigation Index Entries]
+    D2 --> E
+    D3 --> E
+
+    E --> F{Fetch Wiki Content}
+    F -->|Primary| G[DeepWikiMCPClient]
+    G -->|JSON-RPC 2.0 Request| H{MCP Success?}
+    H -->|Yes| J[Raw Markdown Output]
+    H -->|No / Timeout| I[DeepWikiScraperFallback]
+    I -->|HTTP Scrape| J
+
+    J --> K[MarkdownWikiProcessor]
+    
+    subgraph Export Generation
+        K -->|Default Mode| L[Single File Markdown]
+        K -->|--multi-file Mode| M[Multi-File Bundle + README.md]
+    end
 ```
 
-No `pip install` commands are required.
+### Execution Sequence
 
-## Usage
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as User / CLI
+    participant Engine as Export Engine
+    participant MCP as DeepWiki MCP Endpoint
+    participant Web as DeepWiki Web Server
 
-### Basic Single-File Export
+    Client->>Engine: Execute export (repo, output path, flags)
+    Engine->>Engine: Normalize repository input
+    Engine->>Web: Request repository HTML page
+    Web-->>Engine: Return HTML response
+    Engine->>Engine: Extract table of contents & route slugs
 
-Exports the full documentation into a single aggregated Markdown file in the current working directory:
+    alt MCP Endpoint Available
+        Engine->>MCP: JSON-RPC Call (read_wiki_contents)
+        MCP-->>Engine: Return Markdown document content
+    else MCP Request Fails
+        Engine->>Web: Request page content fallback
+        Web-->>Engine: Return scraped content / Next.js state
+    end
 
-```bash
-./export_deepwiki.py d3bvstack/Inception
+    Engine->>Engine: Process headers & split pages (if multi-file)
+    Engine->>Client: Save output file(s) to specified filesystem path
 ```
 
-Or pass a full DeepWiki or GitHub URL:
+---
+
+## Installation & Prerequisites
+
+### System Requirements
+
+- **Python Version**: Python 3.8 or higher.
+- **Dependencies**: None. Only standard library modules are utilized.
+
+### Setup
+
+1. Save the code as `deepwiki_exporter.py`.
+2. Ensure executable permissions are granted:
 
 ```bash
-./export_deepwiki.py https://deepwiki.com/d3bvstack/Inception
+chmod +x deepwiki_exporter.py
 ```
 
-### Multi-File Directory Export
+---
 
-Split sections into structured, ordered files inside a target output directory:
+## Usage Guide
+
+### 1. Single-File Compilation
+
+Consolidate an entire documentation repository into a single Markdown file:
 
 ```bash
-./export_deepwiki.py d3bvstack/Inception -o ./docs/inception --multi-file
+python3 deepwiki_exporter.py d3bvstack/98-webserv -o ./output/webserv_docs.md
 ```
 
-Generates the following structure:
+You can also provide a direct URL:
+
+```bash
+python3 deepwiki_exporter.py https://deepwiki.com/d3bvstack/98-webserv -o ./output/
+```
+
+### 2. Multi-File Documentation Bundle
+
+Export pages as separate Markdown files mapped to their route slugs, along with a top-level `README.md` file:
+
+```bash
+python3 deepwiki_exporter.py d3bvstack/98-webserv -o ./output/webserv-docs/ --multi-file
+```
+
+### 3. Custom MCP Endpoint Specification
+
+Specify an alternative or proxied MCP service endpoint:
+
+```bash
+python3 deepwiki_exporter.py d3bvstack/98-webserv \
+  --multi-file \
+  --mcp-endpoint "https://mcp.custom-domain.com/mcp"
+```
+
+---
+
+## Command-Line Arguments Reference
+
+| Argument | Short Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `repo` | *(None)* | String | *(Required)* | Target repository identifier (`owner/repo`) or complete URL. |
+| `--output` | `-o` | String | `.` | Target output file path or directory destination. |
+| `--multi-file` | *(None)* | Flag | `False` | Splits documentation into individual files corresponding to navigation slugs. |
+| `--mcp-endpoint` | *(None)* | String | `https://mcp.deepwiki.com/mcp` | Base URL for the DeepWiki MCP JSON-RPC service. |
+
+---
+
+## Output Structure
+
+When using the `--multi-file` configuration, the tool generates a directory layout that preserves the navigation context of the source wiki.
+
 ```text
-docs/inception/
-├── README.md              # Auto-generated Index & TOC
-├── 01-0-overview.md       # Chapter content
-├── 02-architecture.md
-└── ...
+output_directory/
+├── README.md               # Generated table of contents with nested links
+├── 1.1-getting-started.md  # Content section mapped to slug
+├── 1.2-configuration.md
+├── 2.1-architecture.md
+└── 2.2-event-loop.md
 ```
 
-### Custom Output File
+### Generated Index Example (`README.md`)
 
-Specify an explicit Markdown file destination:
+Sub-sections reflect the structural depth parsed from the sidebar HTML components:
 
-```bash
-./export_deepwiki.py d3bvstack/Inception -o ./Inception_Wiki.md
+```markdown
+<!--
+  Generated by DeepWiki Exporter
+  Repository: d3bvstack/98-webserv
+  Source: https://deepwiki.com/d3bvstack/98-webserv
+-->
+
+# d3bvstack/98-webserv Documentation
+
+## Table of Contents
+
+- [Getting Started](1.1-getting-started.md)
+  - [Configuration](1.2-configuration.md)
+- [Architecture](2.1-architecture.md)
+  - [Event Loop](2.2-event-loop.md)
 ```
 
-### Custom MCP Server Endpoint
+---
 
-If running a local or private MCP gateway:
+## Error Handling and Technical Specifications
 
-```bash
-./export_deepwiki.py d3bvstack/Inception --mcp-endpoint https://your-mcp-proxy.local/mcp
-```
-
-## CLI Reference
-
-```text
-positional arguments:
-  repo                  Repository identifier or URL. Supported forms:
-                          - 'owner/repo'
-                          - 'https://deepwiki.com/owner/repo'
-                          - 'https://deepwiki.com/owner/repo/1-overview'
-                          - 'https://github.com/owner/repo'
-
-options:
-  -h, --help            Show this help message and exit
-  -o, --output OUTPUT   Target output file path or directory (default: current directory)
-  --multi-file          Split wiki sections into individual markdown files
-  --mcp-endpoint URL    Custom MCP JSON-RPC endpoint URL
-                        (default: https://mcp.deepwiki.com/mcp)
-```
-
-## How It Works
-
-1. **Target Normalization**: Extracts the fundamental `owner/repo` path using standard URL scheme parsing.
-2. **MCP Direct Extraction**: Sends a `tools/call` JSON-RPC method request to call `read_wiki_contents` over HTTP POST. Supports chunked SSE parsing.
-3. **Scraper Fallback**: If the MCP gateway fails, the client issues a standard HTTP GET request to DeepWiki to extract structured JSON props from the Next.js standard data stream (`__NEXT_DATA__`).
-4. **AST Processing**: Parses logical `# Page:` or `H1` level boundaries to construct structured directory hierarchies or flattened unified Markdown documents.
+- **Retry Logic**: Network calls initiated via `DeepWikiMCPClient` attempt up to 3 execution cycles using exponential backoff scaling (`1.5^attempt` seconds).
+- **Format Normalization**: Route strings and section titles undergo regular expression normalization to ensure safe filesystem naming across operating systems.
+- **Server State Extraction**: Next.js JSON payloads (`__NEXT_DATA__`) are automatically inspected to extract structured page props when direct HTML nodes are missing or dynamically hydrated.
