@@ -157,10 +157,10 @@ When using the `--multi-file` configuration, the tool generates a directory layo
 ```text
 output_directory/
 ├── README.md               # Generated table of contents with nested links
-├── 1.1-getting-started.md  # Content section mapped to slug
+├── 1-overview.md
+├── 1.1-getting-started.md 
 ├── 1.2-configuration.md
-├── 2.1-architecture.md
-└── 2.2-event-loop.md
+...
 ```
 
 ### Generated Index Example (`README.md`)
@@ -178,10 +178,13 @@ Sub-sections reflect the structural depth parsed from the sidebar HTML component
 
 ## Table of Contents
 
-- [Getting Started](1.1-getting-started.md)
+- [Overview](1-overview.md)
+  - [Getting Started](1.1-getting-started.md)
   - [Configuration](1.2-configuration.md)
-- [Architecture](2.1-architecture.md)
-  - [Event Loop](2.2-event-loop.md)
+- [Architecture Overview](2-architecture-overview.md)
+  - [Event Loop and epoll Integration](2.1-event-loop-and-epoll-integration.md)
+  - [Server Lifecycle and Connection Management](2.2-server-lifecycle-and-connection-management.md)
+...
 ```
 
 ---
