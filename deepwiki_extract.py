@@ -2,7 +2,8 @@
 """
 DeepWiki Documentation Exporter
 Exports DeepWiki documentation repositories to local Markdown files.
-Supports both single-file aggregated export and structured multi-file directory output.
+Automatically detects and parses sidebar HTML index components and Next.js page state
+from DeepWiki web pages to name files accurately according to their route slugs.
 """
 
 import argparse
@@ -23,20 +24,142 @@ MAX_RETRIES = 3
 BACKOFF_FACTOR = 1.5
 
 
+class IndexHTMLParser:
+    """Parses DeepWiki sidebar HTML elements to extract TOC structure and file slugs."""
+
+    @staticmethod
+    def parse_index_html(html_content: str) -> List[Dict[str, Union[str, int]]]:
+        """
+        Parses <li> elements inside sidebar navigation.
+        Returns a list of dicts with keys: 'title', 'slug', 'href', 'padding_px'.
+        """
+        pattern = re.compile(
+            r'<li[^>]*style="[^"]*padding-left:\s*(\d+)px[^"]*"[^>]*>\s*'
+            r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>\s*</li>',
+            re.DOTALL | re.IGNORECASE
+        )
+
+        entries = []
+        for match in pattern.finditer(html_content):
+            padding_px = int(match.group(1))
+            href = match.group(2).strip()
+            title = re.sub(r'<[^>]+>', '', match.group(3)).strip()  # Clean nested HTML tags
+
+            # Extract slug from href e.g. /d3bvstack/98-webserv/1.1-getting-started -> 1.1-getting-started
+            href_parts = [p for p in href.strip("/").split("/") if p]
+            slug = href_parts[-1] if href_parts else ""
+
+            entries.append({
+                "title": title,
+                "slug": slug,
+                "href": href,
+                "padding_px": padding_px
+            })
+
+        return entries
+
+
+class DeepWikiSidebarFetcher:
+    """Automatically fetches and extracts sidebar index components directly from DeepWiki."""
+
+    @staticmethod
+    def fetch_index(
+        repo_name: str,
+        client: Optional["DeepWikiMCPClient"] = None,
+        timeout: int = DEFAULT_TIMEOUT_SEC
+    ) -> List[Dict[str, Union[str, int]]]:
+        """Fetches page HTML and extracts route slugs and titles for multi-file exports."""
+        url = f"https://deepwiki.com/{repo_name}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+
+        entries = []
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                html = response.read().decode("utf-8")
+
+            repo_parts = repo_name.split("/")
+            repo_slug = repo_parts[-1] if repo_parts else repo_name
+
+            # Method 1: Extract <a> links matching /owner/repo/slug pattern
+            link_pattern = re.compile(
+                r'href=["\'](?:https?://deepwiki\.com)?/(?:' + re.escape(repo_name) + r'|' + re.escape(repo_slug) + r')/([^"\']+)["\'][^>]*>(.*?)</a>',
+                re.DOTALL | re.IGNORECASE
+            )
+
+            seen_slugs = set()
+            for match in link_pattern.finditer(html):
+                slug = match.group(1).strip("/")
+                raw_title = match.group(2)
+                title = re.sub(r'<[^>]+>', '', raw_title).strip()
+
+                padding_px = 0
+                li_before = html[max(0, match.start() - 250):match.start()]
+                pad_match = re.search(r'padding-left:\s*(\d+)px', li_before)
+                if pad_match:
+                    padding_px = int(pad_match.group(1))
+
+                if slug and slug not in seen_slugs:
+                    seen_slugs.add(slug)
+                    entries.append({
+                        "title": title,
+                        "slug": slug,
+                        "padding_px": padding_px
+                    })
+
+            if entries:
+                return entries
+
+            # Method 2: Extract Next.js __NEXT_DATA__ JSON block
+            match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+            if match:
+                next_data = json.loads(match.group(1))
+                json_str = json.dumps(next_data)
+                slug_matches = re.findall(r'/(?:' + re.escape(repo_name) + r')/([0-9][a-zA-Z0-9.-]*)', json_str)
+                for s in slug_matches:
+                    if s not in seen_slugs:
+                        seen_slugs.add(s)
+                        clean_title = re.sub(r'^[0-9.]+-?', '', s).replace('-', ' ').title()
+                        entries.append({"title": clean_title, "slug": s, "padding_px": 0})
+                if entries:
+                    return entries
+
+        except Exception:
+            pass
+
+        # Method 3: Try fetching wiki structure from MCP service if available
+        if client:
+            try:
+                struct_res = client.fetch_wiki_structure(repo_name)
+                if isinstance(struct_res, str):
+                    try:
+                        struct_data = json.loads(struct_res)
+                    except Exception:
+                        struct_data = None
+                else:
+                    struct_data = struct_res
+
+                if isinstance(struct_data, list):
+                    for item in struct_data:
+                        if isinstance(item, dict):
+                            s = item.get("id") or item.get("slug") or item.get("path")
+                            t = item.get("title") or s
+                            if s:
+                                entries.append({"title": t, "slug": s, "padding_px": 0})
+            except Exception:
+                pass
+
+        return entries
+
+
 class DeepWikiURLParser:
     """Parses and normalizes target repository identifiers from various inputs."""
 
     @staticmethod
     def parse_repo_name(input_str: str) -> str:
-        """
-        Extracts owner/repo identifier from URLs or direct repo string inputs.
-        
-        Examples:
-            - https://deepwiki.com/d3bvstack/Inception -> d3bvstack/Inception
-            - https://deepwiki.com/d3bvstack/Inception/1-overview -> d3bvstack/Inception
-            - https://github.com/d3bvstack/Inception -> d3bvstack/Inception
-            - d3bvstack/Inception -> d3bvstack/Inception
-        """
         input_str = input_str.strip()
         if input_str.startswith("http://") or input_str.startswith("https://"):
             parsed = urllib.parse.urlparse(input_str)
@@ -60,7 +183,6 @@ class DeepWikiMCPClient:
         self.timeout = timeout
 
     def _execute_jsonrpc_call(self, method: str, params: dict) -> dict:
-        """Executes a JSON-RPC 2.0 call over HTTP with exponential backoff retries."""
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -84,15 +206,12 @@ class DeepWikiMCPClient:
             except Exception as e:
                 last_exception = e
                 if attempt < MAX_RETRIES - 1:
-                    sleep_time = BACKOFF_FACTOR ** attempt
-                    time.sleep(sleep_time)
+                    time.sleep(BACKOFF_FACTOR ** attempt)
 
         raise RuntimeError(f"MCP RPC call failed after {MAX_RETRIES} attempts. Error: {last_exception}")
 
     def _parse_rpc_response(self, raw_res: str) -> dict:
-        """Parses standard JSON-RPC responses as well as line-delimited SSE chunks."""
         raw_res = raw_res.strip()
-        
         try:
             return json.loads(raw_res)
         except json.JSONDecodeError:
@@ -110,10 +229,9 @@ class DeepWikiMCPClient:
                 except json.JSONDecodeError:
                     continue
 
-        raise ValueError(f"Failed to decode valid JSON-RPC payload from endpoint response: {raw_res[:200]}...")
+        raise ValueError(f"Failed to decode valid JSON-RPC payload from endpoint response.")
 
     def fetch_wiki_structure(self, repo_name: str) -> Union[dict, str]:
-        """Fetches the table of contents structure for a repository."""
         res = self._execute_jsonrpc_call("tools/call", {
             "name": "read_wiki_structure",
             "arguments": {"repoName": repo_name}
@@ -121,7 +239,6 @@ class DeepWikiMCPClient:
         return self._extract_result_content(res)
 
     def fetch_wiki_contents(self, repo_name: str) -> str:
-        """Fetches complete pre-rendered markdown documentation for a repository."""
         res = self._execute_jsonrpc_call("tools/call", {
             "name": "read_wiki_contents",
             "arguments": {"repoName": repo_name}
@@ -132,7 +249,6 @@ class DeepWikiMCPClient:
         return str(content)
 
     def _extract_result_content(self, response: dict) -> Union[str, dict]:
-        """Extracts content payload from JSON-RPC tool response."""
         if "error" in response:
             raise RuntimeError(f"RPC Remote Error [{response['error'].get('code')}]: {response['error'].get('message')}")
 
@@ -151,7 +267,7 @@ class DeepWikiScraperFallback:
     """Fallback parser for direct HTML extraction if the MCP interface is unreachable."""
 
     @staticmethod
-    def scrape_repo_wiki(repo_name: str, timeout: int = DEFAULT_TIMEOUT_SEC) -> str:
+    def scrape_repo_wiki(repo_name: str, timeout: int = DEFAULT_TIMEOUT_SEC) -> Tuple[str, str]:
         url = f"https://deepwiki.com/{repo_name}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
@@ -159,32 +275,47 @@ class DeepWikiScraperFallback:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             html = response.read().decode("utf-8")
 
-        # Extract from Next.js __NEXT_DATA__ block if available
+        index_matches = re.findall(r'<li[^>]*style="padding-left:[^"]*"[^>]*>.*?</li>', html, re.DOTALL)
+        index_html = "".join(index_matches) if index_matches else ""
+
         match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
         if match:
             data = json.loads(match.group(1))
             page_props = data.get("props", {}).get("pageProps", {})
             if "content" in page_props:
-                return page_props["content"]
+                return page_props["content"], index_html
             if "wikiData" in page_props:
-                return json.dumps(page_props["wikiData"], indent=2)
+                return json.dumps(page_props["wikiData"], indent=2), index_html
 
-        # Fallback to HTML text stripping
         body = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL)
         body = re.sub(r'<style.*?>.*?</style>', '', body, flags=re.DOTALL)
         clean_text = re.sub(r'<[^>]+>', '', body)
-        return clean_text
+        return clean_text, index_html
 
 
 class MarkdownWikiProcessor:
     """Processes and formats Markdown content into pages or sections."""
 
     @classmethod
-    def split_into_pages(cls, full_markdown: str) -> List[Tuple[str, str]]:
-        """Splits unified markdown document into discrete section pages based on headers."""
+    def slugify(cls, text: str) -> str:
+        """Converts title string into a filesystem-safe slug."""
+        text = text.lower()
+        text = re.sub(r'[^\w\s-]', '', text)
+        return re.sub(r'[-\s]+', '-', text).strip('-')
+
+    @classmethod
+    def split_into_pages(
+        cls,
+        full_markdown: str,
+        index_entries: Optional[List[Dict[str, Union[str, int]]]] = None
+    ) -> List[Tuple[str, str, str]]:
+        """
+        Splits unified markdown document into discrete section pages based on index or headers.
+        Returns list of tuples: (page_title, file_slug, page_content)
+        """
         lines = full_markdown.splitlines()
-        pages: List[Tuple[str, str]] = []
-        current_title = "0-Overview"
+        pages: List[Tuple[str, List[str]]] = []
+        current_title = "Overview"
         current_lines: List[str] = []
 
         i = 0
@@ -194,28 +325,22 @@ class MarkdownWikiProcessor:
             header_match = re.match(r'^(#+)\s+(.+)$', line)
             
             if page_tag_match:
-                # Found a # Page: marker - this is the primary page delimiter
                 if current_lines:
-                    pages.append((current_title, "\n".join(current_lines)))
+                    pages.append((current_title, current_lines))
                     current_lines = []
                 current_title = page_tag_match.group(1).strip()
-                # Skip the # Page: line itself (don't include in content)
                 i += 1
-                # Skip any blank lines
                 while i < len(lines) and not lines[i].strip():
                     i += 1
-                # Check if next non-blank line is a duplicate heading with same title
                 if i < len(lines):
                     next_header = re.match(r'^#\s+(.+)$', lines[i])
                     if next_header and next_header.group(1).strip() == current_title:
-                        # Include the duplicate heading as the page's H1
                         current_lines.append(lines[i])
                         i += 1
                 continue
             elif header_match and header_match.group(1) == "#":
-                # Regular H1 heading - acts as a page break
                 if current_lines:
-                    pages.append((current_title, "\n".join(current_lines)))
+                    pages.append((current_title, current_lines))
                     current_lines = []
                 current_title = header_match.group(2).strip()
             
@@ -223,16 +348,36 @@ class MarkdownWikiProcessor:
             i += 1
 
         if current_lines:
-            pages.append((current_title, "\n".join(current_lines)))
+            pages.append((current_title, current_lines))
 
-        return pages if pages else [("1-Overview", full_markdown)]
+        # Build lookup tables from index entries
+        slug_map = {}
+        title_map = {}
+        if index_entries:
+            for entry in index_entries:
+                if entry.get("title") and entry.get("slug"):
+                    slug_map[entry["title"].lower()] = entry["slug"]
+                    title_map[cls.slugify(entry["title"])] = entry["slug"]
 
-    @classmethod
-    def slugify(cls, text: str) -> str:
-        """Converts title string into a filesystem-safe slug."""
-        text = text.lower()
-        text = re.sub(r'[^\w\s-]', '', text)
-        return re.sub(r'[-\s]+', '-', text).strip('-')
+        processed_pages: List[Tuple[str, str, str]] = []
+        for idx, (title, content_lines) in enumerate(pages, 1):
+            clean_title = title.strip()
+            norm_title = clean_title.lower()
+            slugified_title = cls.slugify(clean_title)
+
+            # Match slug from index component automatically
+            if index_entries and norm_title in slug_map:
+                slug = slug_map[norm_title]
+            elif index_entries and slugified_title in title_map:
+                slug = title_map[slugified_title]
+            elif index_entries and idx - 1 < len(index_entries):
+                slug = index_entries[idx - 1]["slug"]
+            else:
+                slug = slugified_title or f"page-{idx}"
+
+            processed_pages.append((clean_title, slug, "\n".join(content_lines)))
+
+        return processed_pages
 
 
 def export_deepwiki(
@@ -244,20 +389,38 @@ def export_deepwiki(
     """Main execution function to fetch and save DeepWiki docs."""
     repo_name = DeepWikiURLParser.parse_repo_name(repo_input)
     print(f"[*] Target Repository: {repo_name}")
-    print(f"[*] Connecting to DeepWiki MCP service ({mcp_endpoint})...")
 
-    raw_markdown = ""
+    client = None
     try:
         client = DeepWikiMCPClient(endpoint_url=mcp_endpoint)
+    except Exception:
+        pass
+
+    # Fetch and parse sidebar index component
+    print(f"[*] Extracting sidebar index component from DeepWiki...")
+    index_entries = DeepWikiSidebarFetcher.fetch_index(repo_name, client=client)
+    if index_entries:
+        print(f"[+] Successfully extracted {len(index_entries)} navigation items from sidebar component.")
+    else:
+        print(f"[!] Sidebar component not found. Falling back to title slugification.")
+
+    raw_markdown = ""
+    print(f"[*] Fetching wiki content via MCP ({mcp_endpoint})...")
+    try:
+        if not client:
+            client = DeepWikiMCPClient(endpoint_url=mcp_endpoint)
         raw_markdown = client.fetch_wiki_contents(repo_name)
-        print(f"[+] Successfully fetched documentation via MCP.")
+        print(f"[+] Successfully fetched documentation content via MCP.")
     except Exception as e:
         print(f"[!] MCP fetch failed ({e}). Falling back to Web Scraper...")
         try:
-            raw_markdown = DeepWikiScraperFallback.scrape_repo_wiki(repo_name)
-            print(f"[+] Successfully fetched documentation via Web Scraper fallback.")
+            raw_markdown, scraped_index = DeepWikiScraperFallback.scrape_repo_wiki(repo_name)
+            if not index_entries and scraped_index:
+                index_entries = IndexHTMLParser.parse_index_html(scraped_index)
+                print(f"[+] Extracted {len(index_entries)} navigation items from web scraper fallback.")
+            print(f"[+] Successfully fetched documentation content via Web Scraper fallback.")
         except Exception as fallback_err:
-            print(f"[X] Error: Failed to retrieve documentation from all providers ({fallback_err}).")
+            print(f"[X] Error: Failed to retrieve documentation ({fallback_err}).")
             sys.exit(1)
 
     if not raw_markdown.strip():
@@ -275,24 +438,29 @@ def export_deepwiki(
     if multi_file:
         out_dir = Path(output_path)
         out_dir.mkdir(parents=True, exist_ok=True)
-        pages = MarkdownWikiProcessor.split_into_pages(raw_markdown)
+        pages = MarkdownWikiProcessor.split_into_pages(raw_markdown, index_entries)
         
-        index_entries = [f"# {repo_name} Documentation\n\n## Table of Contents\n"]
+        index_entries_md = [f"# {repo_name} Documentation\n\n## Table of Contents\n"]
         
-        for idx, (title, content) in enumerate(pages, 1):
-            slug = MarkdownWikiProcessor.slugify(title) or f"page-{idx}"
-            file_name = f"{idx:02d}-{slug}.md"
+        for idx, (title, slug, content) in enumerate(pages, 1):
+            file_name = f"{slug}.md" if not slug.endswith(".md") else slug
             file_path = out_dir / file_name
             
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(header_block + content)
             
-            index_entries.append(f"{idx}. [{title}]({file_name})")
+            # Preserve hierarchy indentation matching sidebar HTML
+            indent_spaces = ""
+            if index_entries and idx - 1 < len(index_entries):
+                indent_px = index_entries[idx - 1].get("padding_px", 0)
+                indent_spaces = "  " * (indent_px // 12)
+            
+            index_entries_md.append(f"{indent_spaces}- [{title}]({file_name})")
             print(f"  [->] Saved: {file_path}")
 
         index_path = out_dir / "README.md"
         with open(index_path, "w", encoding="utf-8") as f:
-            f.write(header_block + "\n".join(index_entries) + "\n")
+            f.write(header_block + "\n".join(index_entries_md) + "\n")
         print(f"[+] Multi-file Wiki bundle written to: {out_dir.resolve()}")
 
     else:
@@ -318,7 +486,7 @@ def main():
     )
     parser.add_argument(
         "repo",
-        help="Repository input (e.g. 'https://deepwiki.com/d3bvstack/Inception' or 'd3bvstack/Inception')"
+        help="Repository input (e.g. 'd3bvstack/98-webserv' or 'https://deepwiki.com/d3bvstack/98-webserv')"
     )
     parser.add_argument(
         "-o", "--output",
@@ -328,7 +496,7 @@ def main():
     parser.add_argument(
         "--multi-file",
         action="store_true",
-        help="Split wiki sections into individual markdown files inside a directory"
+        help="Split wiki sections into individual markdown files named by sidebar slugs"
     )
     parser.add_argument(
         "--mcp-endpoint",
@@ -337,8 +505,7 @@ def main():
     )
 
     args = parser.parse_args()
-    
-    # Fix: Access flag as `args.multi_file` instead of `args.multi-file`
+
     export_deepwiki(
         repo_input=args.repo,
         output_path=args.output,
